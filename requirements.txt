@@ -1,0 +1,12 @@
+oracledb
+pandas
+unstructured
+pdfplumber
+pdfminer.six 
+pi-heif
+unstructured_inference
+pdf2image
+pdf_processor
+unstructured.pytesseract
+sentence-transformers
+openai
