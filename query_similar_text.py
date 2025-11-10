@@ -1,14 +1,12 @@
-from python_my_packages.AI.db_processor.db_connection import *
+from openai import OpenAI
+from sentence_transformers import SentenceTransformer
 import array
 import sys
 import os
-from sentence_transformers import SentenceTransformer
-from openai import OpenAI
-
 package_path = "/Users/jayanthan/Learnings/Python"
 if package_path not in sys.path:
     sys.path.append(package_path)
-
+from python_my_packages.AI.db_processor.db_connection import *
 
 def query_similar_texts(question, top_k=5):
 
@@ -77,7 +75,7 @@ if __name__ == "__main__":
     # print(context)
 
     client = OpenAI(
-        api_key=os.getenv("API_KEY"),
+        api_key=os.getenv("GAPI_KEY"),
         base_url="https://api.groq.com/openai/v1",
     )
 
