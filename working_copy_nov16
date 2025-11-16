@@ -1,0 +1,320 @@
+import pdfplumber
+import camelot
+import json
+from openai import OpenAI
+import sys
+from unstructured.partition.pdf import partition_pdf
+
+
+def is_pdf_image_based(pdf_path: str) -> bool:
+    """
+    Returns True if PDF appears to be image-based (no extractable text on any page).
+    """
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            if page.extract_text():  # If any page has text → it's text-based
+                return False
+    return True 
+
+def extract_with_unstructured_page1(unstruct_elements, page_num: int = None) -> list:
+    """
+    Helper function to process a single page using the Unstructured library (OCR/Layout analysis).
+    This function is called only for pages where Camelot failed.
+    """
+    print(f"  --> Running full Unstructured analysis for Page {page_num}...")
+    
+    # We partition the whole document but will filter for the specific page later.
+    # Note: Unstructured requires Tesseract to be installed for OCR capabilities.
+    
+    
+    result = {}
+    for chunk in unstruct_elements:     
+        for element in chunk.metadata.orig_elements:
+            
+        # Check if the element belongs to the current page
+            #if hasattr(element.metadata, 'page_number') and element.metadata.page_number == page_num:
+             
+            # Convert Unstructured element to our standard dict format
+                    
+                    page = getattr(element.metadata, "page_number", None)
+                    if page is None:
+                        continue
+                    if page_num is not None and element.metadata.page_number != page_num:
+                        continue
+                    # Initialize page bucket
+                    if page not in result:
+                        result[page] = {
+                            "page_number": page,
+                            "elements": []
+                        }
+
+                    page_list = result[page]["elements"]
+
+                    # Identify type
+                    cat = element.category
+                    
+                    # ---- TABLE ELEMENT ----
+                    if cat == "Table":
+                        # Finish any ongoing text merge before inserting a table
+                        if page_list and page_list[-1]["type"] == "text":
+                            page_list[-1]["content"] = page_list[-1]["content"].strip()
+
+                        natural_language = table_to_natural_language_openai(
+                                getattr(element.metadata, "text_as_html", None), 
+                                text_content, 
+                                page,
+                                1
+                            )    
+
+                        table_data = {
+                            "type": "table",
+                            "table_number": getattr(element.metadata, "table_number", None),
+                            "table_data_html": getattr(element.metadata, "text_as_html", None),
+                            "table_as_summary": natural_language
+                        }
+                        
+                        print(text_content)
+                       
+                        page_list.append(table_data) 
+                        
+                        continue
+
+                    # ---- TREAT EVERYTHING ELSE AS TEXT ----
+                    text_content = getattr(element, "text", None) or getattr(element, "content", None)
+                    
+                    if text_content and text_content.strip():
+                        # If last element is also text, merge
+                        if page_list and page_list[-1]["type"] == "text":
+                            page_list[-1]["content"] += "\n" + text_content.strip()
+                        else:
+                            # Start a new text block
+                            page_list.append({
+                                "type": "text",
+                                "content": text_content.strip()
+                            })
+            # Optional: sort pages
+            
+        result = dict(sorted(result.items()))    
+    if page_num is None:
+        return result  
+    else:    
+        return page_list
+
+
+
+def table_to_natural_language_openai(df, context, page_num, table_num):
+    """
+    Use OpenAI to convert table to natural language
+    """
+    
+    # Convert DataFrame to markdown for LLM
+    #table_markdown = df.to_markdown(index=False)
+    client = OpenAI(api_key="xxxxxx",base_url="https://api.groq.com/openai/v1")
+
+    prompt = f"""You are converting a table from a regulatory document into clear, natural language for a RAG system.
+
+Context from the document:
+{context if context else "No context available"}
+
+Table (Page {page_num}, Table {table_num}):
+{df}
+
+Convert this table into clear, natural language sentences that:
+1. Preserve all important information
+2. Are easy to search and retrieve
+3. Include context from the surrounding text
+4. Use proper sentence structure
+5. Explain what the table shows
+6. Table data will be in Json or HTML format
+
+Return ONLY the natural language text, no preamble."""
+
+    try:
+        response = client.chat.completions.create(
+            model="openai/gpt-oss-20b",  # or "gpt-4o-mini" for cheaper option
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that converts tables to natural language for document search systems."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=2000
+        )
+        
+        return response.choices[0].message.content.strip()
+    
+    except Exception as e:
+        print(f"    Warning: OpenAI conversion failed: {e}")
+        # Fallback to simple conversion
+        sys.exit(1)
+
+def extract_with_sequence_json(pdf_path):
+    """
+    Extract text and tables in correct reading order
+    Tables in JSON format
+    """
+    
+    # Extract tables with Camelot
+    print("Extracting tables with Camelot...")
+    camelot_tables = camelot.read_pdf(pdf_path, pages='all', flavor='lattice')
+    print(camelot_tables)
+    # Group Camelot tables by page
+    tables_by_page = {}
+    for table in camelot_tables:
+        if table.page not in tables_by_page:
+            tables_by_page[table.page] = []
+        tables_by_page[table.page].append(table)
+    
+    result = {}
+    
+    # Extract with pdfplumber maintaining sequence
+    with pdfplumber.open(pdf_path) as pdf:
+        unstruct_elements = None
+        for page_num, page in enumerate(pdf.pages, 1):
+            print(f"Processing page {page_num}...")
+            
+            elements = []  # Will store text and tables in order
+            elements_with_AI = []
+            
+            # Detect table positions
+            table_regions = page.find_tables()
+            
+            if not table_regions:
+                # No tables - just text
+                print("No tables found.. Extracting All text")
+                text = page.extract_text()
+                if text:
+                    elements.append({
+                        "type": "text",
+                        "content": text
+                    })
+            else:
+
+                camelot_page_tables = tables_by_page.get(page_num, [])
+                if not camelot_page_tables:
+                    print("pdfplumber detected the table, but camelot can't.So fallback to unstruct")
+                    if unstruct_elements is None:
+                        unstruct_elements = partition_pdf( filename=pdf_path,
+                        infer_table_structure=True,            # extract tables
+                        strategy="hi_res",                     # mandatory to infer tables
+                        extract_image_block_types=["Table"],   # Add 'Table' to list to extract image of tables
+                        # image_output_dir_path=output_path,   # if None, images and tables will saved in base64
+                        extract_image_block_to_payload=True,   # if true, will extract base64 for API usage
+                        chunking_strategy="by_title",          # or 'basic'
+                        max_characters=10000,                  # defaults to 500
+                        combine_text_under_n_chars=2000,       # defaults to 0
+                        new_after_n_chars=6000,
+                    )
+                    unstrcut_result=extract_with_unstructured_page1(unstruct_elements,page_num)
+                    elements=unstrcut_result
+                    
+                    
+                else:
+            # Sort table regions by position (top to bottom)
+                    print("tables found.. Using bbox ")
+                    sorted_regions = sorted(table_regions, key=lambda t: t.bbox[1])
+                    
+                    prev_y = 0
+                    
+                    for table_idx, table_region in enumerate(sorted_regions):
+                        bbox = table_region.bbox
+                        # Extract text BEFORE this table
+                        if bbox[1] > prev_y + 5:
+                            try:
+                                text_before = page.crop((0, prev_y, page.width, bbox[1])).extract_text()
+                                if text_before and text_before.strip():
+                                    elements.append({
+                                        "type": "text",
+                                        "content": text_before.strip()
+                                    })
+                            except Exception as e:
+                                print(f"  Warning: {e}")
+                        
+                        # Add Camelot table in JSON format
+                        current_context=text_before.strip()
+                        
+                        if table_idx < len(camelot_page_tables):
+                            table = camelot_page_tables[table_idx]
+
+                            natural_language = table_to_natural_language_openai(
+                                table.df.to_json(orient='records', indent=4), 
+                                current_context, 
+                                page_num,
+                                table_idx + 1
+                            )
+                            
+                            elements.append({
+                                "type": "table",
+                                "table_number": table_idx + 1,
+                                "json_data": table.df.to_json(orient='records', indent=4),
+                                "table_summary": natural_language,
+                                "accuracy": table.parsing_report["accuracy"],
+                                "rows": table.df.shape[0],
+                                "columns": table.df.shape[1]
+                            })
+                            
+                            # natural_language = table_to_natural_language_openai(
+                            #     table.df, 
+                            #     current_context, 
+                            #     page_num,
+                            #     table_idx + 1
+                            # )
+                            # elements.append({
+                            #     "type": "table_summary", # New element type for the summary
+                            #     "table_number": table_idx + 1,
+                            #     "content": natural_language
+                            # })
+                        
+                        prev_y = bbox[3]  # Bottom of table
+                    
+                    # Text AFTER last table
+                    if prev_y < page.height - 5:
+                        try:
+                            text_after = page.crop((0, prev_y, page.width, page.height)).extract_text()
+                            if text_after and text_after.strip():
+                                elements.append({
+                                    "type": "text",
+                                    "content": text_after.strip()
+                                })
+                        except Exception as e:
+                            print(f"  Warning: {e}")
+                
+                result[page_num] = {
+                    "page_number": page_num,
+                    "elements": elements  # Elements in reading order!
+                }
+    
+    return result
+
+
+pdf_path = "/Users/jayanthan/Downloads/BOM_KB_IBA/2025/1752660974437.pdf"
+
+if is_pdf_image_based(pdf_path):
+    print("PDF is image-based. Using OCR/Unstructured parser...")
+    unstruct_elements = partition_pdf( filename=pdf_path,
+                        infer_table_structure=True,            # extract tables
+                        strategy="hi_res",                     # mandatory to infer tables
+                        extract_image_block_types=["Table","Image"],   # Add 'Table' to list to extract image of tables
+                        # image_output_dir_path=output_path,   # if None, images and tables will saved in base64
+                        extract_image_block_to_payload=True,   # if true, will extract base64 for API usage
+                        chunking_strategy="basic",          # or 'basic'
+                        max_characters=10000,     
+                        ocr_kwargs={"psm": 6},                        # defaults to 500
+                        combine_text_under_n_chars=2000,       # defaults to 0
+                        new_after_n_chars=6000,
+                    )
+    result = extract_with_unstructured_page1(unstruct_elements)
+
+else:
+    print("PDF is text-based. Using text parser...")
+    # Call text-based parser, e.g., Camelot or your text parser
+    result = extract_with_sequence_json(pdf_path)
+
+# Usage
+#document = extract_with_sequence_json('/Users/jayanthan/Desktop/MD11024D1EF9CB39B44ABB23DF586173E0CDE.PDF') #50 pages
+#document = extract_with_sequence_json('/Users/jayanthan/Downloads/BOM_KB_IBA/2022/1659351432544.pdf') #IMage
+#document = extract_with_sequence_json('/Users/jayanthan/Downloads/BOM_KB_IBA/2025/1752660974437.pdf')##one page
+#document = extract_with_sequence_json('/Users/jayanthan/Downloads/BOM_KB_IBA/2023/1685096545445.pdf') #image
+
+#print(document)
+print(json.dumps(result, indent=2, ensure_ascii=False))
+
